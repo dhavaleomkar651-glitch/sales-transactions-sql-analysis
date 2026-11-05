@@ -1,105 +1,109 @@
-# sales-transactions-sql-analysis
-An end-to-end SQL project in MySQL: importing a messy flat CSV, auditing data quality, normalising it into a relational schema with primary and foreign keys, and answering 55 business and technical questions using joins, aggregations, subqueries, CTEs and window functions.
+Sales Transactions SQL Project (MySQL)
 
-Author: Omkar Dhavale · LinkedIn Tools: MySQL 8, MySQL Workbench (Python/pandas used only to cross-check results)
+A MySQL project that takes a flat sales CSV, finds and fixes a data quality problem (duplicate transaction IDs), splits the data into a relational schema with primary and foreign keys, and then answers business questions using joins, aggregations, subqueries, CTEs and window functions.
+
+Author: Omkar Dhavale · LinkedIn Tools: MySQL 8, MySQL Workbench Script: sales_db.sql
 
 1. Dataset
 Item	Detail
-File	Sales_transactions_2022-2025.csv
+Source file	Sales_transactions_2022-2025.csv
 Raw rows	18,045
-Columns	10 (Transaction_ID, Order_ID, Customer_ID, Customer_Name, Customer_Age, Customer_Gender, Customer_Segment, Order_Date, Order_Time, Sales_Channel)
+Columns	10: Transaction_ID, Order_ID, Customer_ID, Customer_Name, Customer_Age, Customer_Gender, Customer_Segment, Order_Date, Order_Time, Sales_Channel
 Period	1 Jan 2022 – 31 Dec 2025
-Customers	4,882 unique Customer_IDs
-Orders	14,541 unique Order_IDs
+After de-duplication	18,000 transactions, 14,541 orders, 4,882 customers
 Channels	Online, Retail Store, B2B Portal, Phone Order
 
 The file has no price, quantity or product columns, so all analysis is based on transaction counts, not revenue.
 
-2. Data quality issues found
-Issue	Detail
-Duplicate rows	45 Transaction_IDs appeared twice as exact duplicate rows (18,045 raw → 18,000 unique transactions). This blocked adding a primary key (Error 1062: Duplicate entry).
-Inconsistent gender values	6 spellings for 3 real values: Female, FEMALE, Male, male, Non-binary, Non Binary.
-Missing values	108 names, 218 ages and 162 genders are blank in the raw file.
-Age outliers	Ages range from 4 to 112; the middle 50% of customers are 32–46.
-Segment is not stable per customer	2,215 of 4,882 customers (45%) appear under more than one Customer_Segment (e.g. "New Customer" later becomes "Returning Customer"). Segment is therefore a transaction-level attribute, not a fixed customer attribute.
-Repeated names	Many different customers share a name (1,087 names belong to more than one Customer_ID), so name cannot be used as an identifier.
-3. Cleaning and schema design
+2. What the script does
+Step 1: Staging table
 
-Step 1: Load. The CSV is loaded as-is into a staging table sales_raw, which is never modified.
+The CSV is imported into sales_raw, a copy of the file with matching data types (DATE for dates, TIME for times, DECIMAL for age). It is kept untouched as the source of truth. The import itself is done with MySQL's import tools and is not part of the script.
 
-Step 2: Remove duplicates. ROW_NUMBER() OVER (PARTITION BY Transaction_ID ...) keeps one row per transaction, leaving 18,000 rows.
+Step 2: Split the flat file into three tables
+customers                     channels                    transactions
+----------------------        --------------------        ----------------------------
+Customer_ID   (PK)     <--+   channel_id   (PK)     <--+  Transaction_ID  (PK)
+name                      |   channel_name (UNIQUE)     |  Order_ID
+age                       |                             |  Customer_ID    (FK -> customers)
+gender                    +-----------------------------+  channel_id     (FK -> channels)
+segment                                                    Order_Date
+                                                           Order_Time
+customers is built with GROUP BY Customer_ID so there is one row per customer, and Customer_ID becomes the primary key.
+channels is a lookup table of the 4 distinct sales channels, with an auto-increment key.
+transactions is built by joining sales_raw to channels to replace the channel text with channel_id.
+Step 3: A real data problem, and the fix
 
-Step 3: Split the flat file into three tables and enforce integrity with keys:
+Adding a primary key on Transaction_ID failed:
 
-customers                    channels                  transactions
----------------------        -------------------       ------------------------------
-Customer_ID  (PK)    <---+   channel_id   (PK)  <--+   Transaction_ID (PK)
-name                     |   channel_name (UNIQUE)  |   Order_ID
-age                      |                          |   Customer_ID   (FK -> customers)
-gender                   +--------------------------+   channel_id    (FK -> channels)
-                                                        segment
-                                                        Order_Date
-                                                        Order_Time
+Error Code: 1062. Duplicate entry 'T02005299' for key 'transaction.PRIMARY'
+
+Investigating with GROUP BY ... HAVING COUNT(*) > 1 showed 45 transaction IDs appear twice as exact duplicate rows (18,045 raw rows vs 18,000 unique IDs). They were removed with a window function, keeping one row per ID:
+
 sql
-ALTER TABLE transactions
-  ADD PRIMARY KEY (Transaction_ID),
+CREATE TABLE transactions_clean AS
+SELECT Transaction_ID, Order_ID, Customer_ID, channel_id, Order_Date, Order_Time
+FROM (
+  SELECT t.*,
+         ROW_NUMBER() OVER (PARTITION BY Transaction_ID ORDER BY Order_Date, Order_Time) AS rn
+  FROM `transaction` t
+) x
+WHERE rn = 1;
+Step 4: Enforce integrity
+
+Once the data was clean, the primary key and two foreign keys were added, the old table dropped, and the clean table renamed to transactions:
+
+sql
+ALTER TABLE transactions_clean
+  MODIFY Transaction_ID VARCHAR(20) NOT NULL,
+  ADD PRIMARY KEY (Transaction_ID);
+
+ALTER TABLE transactions_clean
   ADD CONSTRAINT fk_cust FOREIGN KEY (Customer_ID) REFERENCES customers(Customer_ID),
   ADD CONSTRAINT fk_chan FOREIGN KEY (channel_id)  REFERENCES channels(channel_id);
+Step 5: Validate
 
-Step 4: Standardise gender.
+A LEFT JOIN between transactions and customers (filtering for NULL on the customer side) checks that no transaction points to a missing customer.
 
-sql
-UPDATE customers
-SET gender = CASE
-    WHEN LOWER(gender) = 'male'                           THEN 'Male'
-    WHEN LOWER(gender) = 'female'                         THEN 'Female'
-    WHEN LOWER(REPLACE(gender,'-',' ')) = 'non binary'    THEN 'Non-binary'
-    ELSE gender END;
+3. Analysis queries
+Level	Topics	Examples
+1. Basics	SELECT, WHERE, DISTINCT, MIN/MAX, COUNT	Row counts, date range, transactions in 2024
+2. Group by	GROUP BY, HAVING, ORDER BY	Transactions per year and month, customers with more than 5 transactions
+3. Joins	Multi-table JOIN, self join	Transactions with customer and channel names, top 10 customers, customers sharing a name
+4. Subqueries and CTEs	Nested queries, NOT EXISTS, RANK, INTERSECT	Customers above average, online-only customers, busiest month per year, churned customers
+5. Window functions	ROW_NUMBER, RANK, SUM() OVER, LAG	First purchase per customer, channel ranking per year, running totals, days between purchases
+4. Results
 
-Step 5: Keep segment on the transaction, not the customer, because it changes over time.
+Figures below are from the 18,000 de-duplicated transactions.
 
-sql
-ALTER TABLE transactions ADD COLUMN segment VARCHAR(30);
+Transactions per channel
 
-UPDATE transactions t
-JOIN (SELECT DISTINCT Transaction_ID, Customer_Segment FROM sales_raw) r
-  ON r.Transaction_ID = t.Transaction_ID
-SET t.segment = r.Customer_Segment;
+Channel	Transactions	Share
+Online	8,195	45.5%
+Retail Store	6,221	34.6%
+B2B Portal	2,124	11.8%
+Phone Order	1,460	8.1%
 
-ALTER TABLE customers DROP COLUMN segment;
+Transactions per year
 
-Step 6: Validate. Foreign keys can be tested by inserting a transaction for a non-existent customer, which should be rejected (Q52 in the SQL file). The headline results in section 4 were also cross-checked independently in pandas.
+Year	Transactions	Change
+2022	4,087	n/a
+2023	4,599	+12.5%
+2024	4,345	−5.5%
+2025	4,969	+14.4%
 
-4. Key findings
+Other findings
 
-All numbers are from the 18,000 de-duplicated transactions.
-
-#	Finding	Result
-1	Top channel	Online is the largest channel at 45.5% of transactions, followed by Retail Store (34.6%), B2B Portal (11.8%) and Phone Order (8.1%). Online is #1 in every customer segment.
-2	Seasonality	December is the busiest month in all four years; November and December together account for about 24% of all transactions. The peak was Dec 2025 with 636 transactions, against a monthly average of 375. January is the slowest month.
-3	Year-over-year trend	Transactions: 4,087 (2022) → 4,599 (2023, +12.5%) → 4,345 (2024, −5.5%) → 4,969 (2025, +14.4%).
-4	Customer retention	58.6% of 2022 customers (1,522 of 2,596) bought again in 2023.
-5	Repeat behaviour	75.8% of customers (3,700 of 4,882) made more than one transaction; the average is 3.7 transactions per customer and the maximum is 20.
-6	Timing patterns	Weekdays carry 78% of transactions (weekends 22%). About 46% of all transactions happen between 1 PM and 6 PM, with 3 PM the busiest hour.
-7	Customer mix	Consumer is the largest segment (44.6% of transactions), then Small Business (17.6%) and Returning Customer (13.7%). Premium is the smallest (4.4%).
-5. What the SQL file covers
-
-sql_practice_questions.sql contains 55 queries plus 5 bonus challenges:
-
-Level	Topics
-1	SELECT, WHERE, ORDER BY, LIMIT, NULL handling
-2	GROUP BY, HAVING, aggregates, pivot-style counts
-3	INNER / LEFT / SELF joins, multi-table joins
-4	Subqueries, NOT EXISTS, CTEs, INTERSECT
-5	ROW_NUMBER, RANK, LAG, NTILE, running totals, moving averages
-6	CASE, date/time logic, retention, YoY growth, repeat-customer analysis
-7	Indexes and EXPLAIN, views, transactions and rollback, foreign key tests, stored procedure
-6. How to run it
-Create the database and the sales_raw staging table, then import the CSV (Workbench Table Data Import Wizard works).
-Run the cleaning and schema steps from section 3.
-Open sql_practice_questions.sql and run the queries one at a time.
-7. Limitations and next steps
-No revenue, price or product data, so findings are volume-based only.
-45% of customers change segment over time, so segment results are per transaction.
-Missing age, name and gender values were left as NULL rather than imputed.
-Next step: connect Power BI to the MySQL database and build a dashboard of monthly trends, channel mix and retention.
+Busiest month: December in every year (501 in 2022, 555 in 2023, 528 in 2024, 636 in 2025).
+Returning customers: 1,572 customers bought in both 2022 and 2025.
+Churn: 1,074 of the 2,596 customers who bought in 2022 did not buy in 2023, so 58.6% came back the next year.
+5. Known limitations and next steps
+Segment is not a stable customer attribute. 2,215 of 4,882 customers (45%) appear under more than one Customer_Segment (for example "New Customer" later becoming "Returning Customer"). The customers table currently keeps one value per customer using MAX(), so segment-based queries are approximations. A better design stores segment on transactions.
+Gender needs standardising. The raw data has six spellings of three values (Male, male, Female, FEMALE, Non-binary, Non Binary).
+Missing and odd values are left as-is: 108 names, 218 ages and 162 genders are blank, and ages range from 4 to 112.
+No revenue data, so the analysis counts transactions only.
+Next step: connect Power BI to this database for a dashboard of monthly trends, channel mix and customer retention.
+6. How to run
+Run sales_db.sql from the top to create the database and tables.
+Import Sales_transactions_2022-2025.csv into sales_raw (Workbench: right-click the table, then Table Data Import Wizard).
+Run the remaining statements in order, then the analysis queries one at a time.
